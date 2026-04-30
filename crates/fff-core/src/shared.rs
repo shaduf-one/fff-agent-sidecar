@@ -85,6 +85,24 @@ impl SharedPicker {
         true
     }
 
+    /// Trigger a full filesystem rescan without blocking the caller.
+    ///
+    /// Delegates to the unified scan orchestrator in [`crate::scan`]. The
+    /// worker thread walks the filesystem off-lock, swaps `sync_data`
+    /// under a brief write, then applies git status, frecency, warmup,
+    /// and bigram rebuild — all off-lock aside from two µs-long writes.
+    /// Returns immediately.
+    pub fn trigger_full_rescan_async(&self, shared_frecency: &SharedFrecency) -> Result<(), Error> {
+        if let Some(job) = crate::scan::ScanJob::new(
+            self,
+            shared_frecency,
+            /*install_watcher=*/ false,
+        )? {
+            job.spawn();
+        }
+        Ok(())
+    }
+
     /// Refresh git statuses for all indexed files.
     pub fn refresh_git_status(&self, shared_frecency: &SharedFrecency) -> Result<usize, Error> {
         use git2::StatusOptions;

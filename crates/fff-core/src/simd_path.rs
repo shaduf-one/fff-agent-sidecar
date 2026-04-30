@@ -317,16 +317,19 @@ impl ChunkedPathStoreBuilder {
     pub fn add_file_immediate(&mut self, rel_path: &str, filename_offset: u16) -> ChunkedString {
         let path_bytes = rel_path.as_bytes();
         let byte_len = rel_path.len();
-        let n_chunks = chunks_needed(byte_len);
-        let mut indices = ChunkIndices::with_capacity(n_chunks);
+        let mut indices = ChunkIndices::with_capacity(chunks_needed(byte_len));
 
-        for i in 0..n_chunks {
-            let chunk_start = i * SIMD_CHUNK_BYTES;
-            let chunk_end = (chunk_start + SIMD_CHUNK_BYTES).min(byte_len);
+        for chunk in path_bytes.chunks(SIMD_CHUNK_BYTES) {
             let mut chunk_bytes = [0u8; SIMD_CHUNK_BYTES];
-            chunk_bytes[..chunk_end - chunk_start]
-                .copy_from_slice(&path_bytes[chunk_start..chunk_end]);
+            chunk_bytes[..chunk.len()].copy_from_slice(chunk);
 
+            // Dedup every chunk (including the filename tail). Earlier
+            // iteration of this code skipped dedup on the last chunk
+            // under the theory that filename tails are ~unique and the
+            // hashmap growth wasn't worth it. Empirically (chromium) the
+            // arena bloat from storing ~N unique 16-byte chunks far
+            // outweighs the hashmap savings (~+5 MB chunked_store per
+            // 500k files). So: always dedup.
             let arena_idx = match self.chunk_dedup.get(&chunk_bytes) {
                 Some(&idx) => idx,
                 None => {
@@ -336,6 +339,7 @@ impl ChunkedPathStoreBuilder {
                     idx
                 }
             };
+
             indices.push(arena_idx);
         }
 

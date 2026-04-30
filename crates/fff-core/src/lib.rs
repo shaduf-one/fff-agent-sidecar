@@ -92,7 +92,11 @@
 //! ```
 
 mod background_watcher;
-mod bigram_filter;
+mod scan;
+// public only for benchmarks — the inverted index is still re-exported via
+// `pub use bigram_filter::*` below for external consumers.
+#[doc(hidden)]
+pub mod bigram_filter;
 pub mod bigram_query;
 mod constraints;
 mod db_healthcheck;

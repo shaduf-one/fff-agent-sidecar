@@ -62,3 +62,11 @@ lto = "thin"
 
 [profile.bench]
 inherits = "release"
+
+# For Instruments / xctrace: release-level optimization but keep debuginfo
+# and symbols so sampled frames resolve to real Rust names.
+[profile.prof]
+inherits = "release"
+debug = "full"
+strip = false
+lto = "thin"

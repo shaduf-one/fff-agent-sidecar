@@ -744,18 +744,10 @@ pub unsafe extern "C" fn fff_scan_files(fff_handle: *mut c_void) -> *mut FffResu
         Err(e) => return e,
     };
 
-    let mut guard = match inst.picker.write() {
-        Ok(g) => g,
-        Err(e) => return FffResult::err(&format!("Failed to acquire file picker lock: {}", e)),
-    };
-
-    let picker = match guard.as_mut() {
-        Some(p) => p,
-        None => return FffResult::err("File picker not initialized"),
-    };
-
-    match picker.trigger_rescan(&inst.frecency) {
-        Ok(_) => FffResult::ok_empty(),
+    // Async: rescan runs on a BG thread, caller returns immediately.
+    // Use `fff_is_scanning` / `fff_wait_for_scan` to observe progress.
+    match inst.picker.trigger_full_rescan_async(&inst.frecency) {
+        Ok(()) => FffResult::ok_empty(),
         Err(e) => FffResult::err(&format!("Failed to trigger rescan: {}", e)),
     }
 }
@@ -905,13 +897,16 @@ pub unsafe extern "C" fn fff_restart_index(
 
     let (warmup_caches, content_indexing, watch, mode) = if let Some(mut picker) = guard.take() {
         let warmup = picker.need_enable_mmap_cache();
-        let ci = picker.need_enable_content_indexing();
-        let w = picker.need_watch();
+        let enable_content_indexing = picker.need_enable_content_indexing();
+        let watch = picker.need_watch();
         let mode = picker.mode();
+
         picker.stop_background_monitor();
-        (warmup, ci, w, mode)
+
+        (warmup, enable_content_indexing, watch, mode)
     } else {
-        (false, false, true, FFFMode::default())
+        // this is error state anyway
+        (false, true, true, FFFMode::default())
     };
 
     drop(guard);
