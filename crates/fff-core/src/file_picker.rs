@@ -48,7 +48,7 @@ use crate::types::{
     PaginationArgs, Score, ScoringContext, SearchResult,
 };
 use fff_query_parser::FFFQuery;
-use git2::{Repository, Status, StatusOptions};
+use git2::{Repository, Status};
 use rayon::prelude::*;
 use std::fmt::Debug;
 use std::ops::ControlFlow;
@@ -612,6 +612,7 @@ impl FilePicker {
             watcher_ready: Arc::clone(&self.signals.watcher_ready),
             cancelled: Arc::clone(&self.signals.cancelled),
             post_scan_busy: Arc::clone(&self.signals.post_scan_busy),
+            rescan_pending: Arc::clone(&self.signals.rescan_pending),
         }
     }
 
@@ -1534,6 +1535,15 @@ impl FilePicker {
             Ok(index) => {
                 let file = &mut self.sync_data.files[index];
                 file.set_deleted(true);
+                // Clear any cached git status — the tombstone no longer
+                // corresponds to a real worktree file, so any previously
+                // cached status (e.g. `WT_MODIFIED` from before the
+                // delete) is actively misleading. All user-facing search
+                // paths filter `is_deleted()` so this is invisible today,
+                // but keeping the invariant "tombstone ⇒ git_status=None"
+                // means a new reader that forgets the filter can't leak
+                // stale data.
+                file.git_status = None;
                 file.invalidate_mmap(&self.cache_budget);
                 if let Some(ref overlay) = self.sync_data.bigram_overlay {
                     overlay.write().delete_file(index);
@@ -1837,10 +1847,7 @@ pub(crate) fn walk_filesystem(
     let git_handle = std::thread::spawn(move || {
         GitStatusCache::read_git_status(
             git_workdir_for_status.as_deref(),
-            StatusOptions::new()
-                .include_untracked(true)
-                .recurse_untracked_dirs(true)
-                .exclude_submodules(true),
+            &mut crate::git::default_status_options(),
         )
     });
 
@@ -1913,10 +1920,30 @@ pub(crate) fn walk_filesystem(
         pairs.len(),
     );
 
-    // Sort by full relative path. This groups files by directory naturally,
-    // so dir extraction becomes a simple linear scan — no HashMap.
+    // Sort by (dir_part, filename). This groups files by their directory
+    // into contiguous runs so the linear dir-extraction pass below can
+    // dedupe by comparing only against the previous dir.
+    //
+    // An earlier version sorted by full relative path. That ordering works
+    // for uniform depths but breaks for mixed trees: root-level files with
+    // names that sort between two subdirectories end up interleaved,
+    // causing the consecutive-dedup to emit the root dir multiple times
+    // (e.g. seed order `README.md`, `d_foo/a.rs`, `f_root.rs`, `src/x.rs`
+    // produced `dirs = ["", "d_foo/", "", "src/"]`). The duplicate broke
+    // `find_file_index`'s binary search — files with `parent_dir=0` became
+    // unreachable when the search resolved `dir_rel=""` to the duplicate
+    // at index 2.
     BACKGROUND_THREAD_POOL.install(|| {
-        pairs.par_sort_unstable_by(|(_, a), (_, b)| a.cmp(b));
+        pairs.par_sort_unstable_by(|(a, path_a), (b, path_b)| {
+            let a_off = a.path.filename_offset as usize;
+            let b_off = b.path.filename_offset as usize;
+            // SAFETY note: `filename_offset` is a byte offset into the
+            // UTF-8 relative path that the walker recorded. It always
+            // lies on a character boundary.
+            let (a_dir, a_name) = path_a.split_at(a_off);
+            let (b_dir, b_name) = path_b.split_at(b_off);
+            a_dir.cmp(b_dir).then_with(|| a_name.cmp(b_name))
+        });
     });
 
     // Build ChunkedPathStore + extract dirs + assign parent_dir in one pass.

@@ -1,4 +1,8 @@
 fn main() {
+    // Opt-in cfg for the long-running randomized stress tests
+    // used by tests/fuzz_git_watcher_stress.rs
+    println!("cargo::rustc-check-cfg=cfg(stress)");
+
     // When the `zlob` feature is enabled (Zig-compiled C library):
     // On Windows MSVC, explicitly link the C runtime libraries.
     // Zig-compiled static libraries don't emit /DEFAULTLIB directives for the

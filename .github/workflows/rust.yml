@@ -39,6 +39,76 @@ jobs:
       - name: Run tests
         run: cargo test --features zlob --workspace --exclude fff-nvim
 
+  stress-test:
+    name: Stress Test (Watcher + Git)
+    # Cross-platform: macOS uses FSEvents, Ubuntu uses inotify — different
+    # backends with different debouncer quirks and race windows, so
+    # running the same fuzz suite on both is the whole point. A job
+    # failure on either platform fails the CI gate.
+    #
+    # Matches the `test` job matrix above; Windows is not exercised
+    # anywhere else in CI, so wiring it up here would be asymmetric and
+    # would surface `ReadDirectoryChangesW`-specific noise without a
+    # corresponding signal. Add it when the rest of CI does.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Keep going after one OS fails so we can see whether a bug
+      # reproduces everywhere or is platform-specific.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    # Long-running; don't let a stuck watcher thread burn a full CI
+    # timeout. Two scenarios should finish well under this limit.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1.15.4
+        with:
+          cache: true
+          cache-on-failure: true
+          cache-key: "v1-rust-stress-${{ matrix.os }}"
+          components: rustfmt, clippy
+
+      # Run 1: deterministic. Pins a regression surface that must not
+      # regress between builds. Seed is hard-coded in the Makefile; if
+      # you need to replay a different seed locally, prefix with
+      # `FFF_STRESS_SEED=<u64|0xHEX>`.
+      - name: Stress test (seeded / deterministic)
+        shell: bash
+        run: make test-stress-seeded
+        env:
+          FFF_STRESS_CASES: "3"
+          FFF_STRESS_MIN_OPS: "30"
+          FFF_STRESS_MAX_OPS: "50"
+
+      # Run 2: random. Every CI build explores a fresh slice of the op
+      # space. If this ever goes red, proptest persists the failing seed
+      # to `crates/fff-core/tests/fuzz_git_watcher_stress.proptest-regressions`;
+      # that file gets uploaded as an artifact so the failure is
+      # reproducible locally.
+      - name: Stress test (random / proptest)
+        shell: bash
+        run: make test-stress-random
+        env:
+          FFF_STRESS_CASES: "5"
+          FFF_STRESS_MIN_OPS: "30"
+          FFF_STRESS_MAX_OPS: "60"
+
+      - name: Upload proptest regressions on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proptest-regressions-${{ matrix.os }}
+          path: crates/fff-core/tests/fuzz_git_watcher_stress.proptest-regressions
+          if-no-files-found: ignore
+
   fmt:
     name: cargo fmt
     runs-on: ubuntu-latest

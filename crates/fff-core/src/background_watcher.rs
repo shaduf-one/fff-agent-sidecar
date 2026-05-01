@@ -349,6 +349,7 @@ fn handle_debounced_events(
     let mut need_full_rescan = false;
     let mut need_full_git_rescan = false;
     let mut paths_to_remove = Vec::new();
+    let mut dirs_to_remove: Vec<PathBuf> = Vec::new();
     let mut paths_to_add_or_modify = Vec::new();
     let mut new_dirs_to_watch = Vec::new();
     let mut affected_paths_count = 0usize;
@@ -410,8 +411,20 @@ fn handle_debounced_events(
             //   - Remove events are not always emitted (macOS often sends
             //     Modify(Name(Any)) instead of Remove).
             let is_removal = matches!(debounced_event.event.kind, EventKind::Remove(_));
+            // Directory-level remove: macOS FSEvents delivers a single
+            // `Remove(Folder)` event for a whole directory tree (e.g.
+            // after `git reset --hard` wipes a dir full of staged-but-
+            // uncommitted files). Individual per-file Remove events for
+            // the children do *not* arrive. Treat the folder removal as
+            // "evict every indexed descendant".
+            let is_folder_removal = matches!(
+                debounced_event.event.kind,
+                EventKind::Remove(notify::event::RemoveKind::Folder)
+            );
 
-            if is_removal || !path.exists() {
+            if is_folder_removal {
+                dirs_to_remove.push(path.to_path_buf());
+            } else if is_removal || !path.exists() {
                 paths_to_remove.push(path.as_path());
             } else if path.is_dir() {
                 // New directory — collect it so the caller can register a
@@ -459,60 +472,72 @@ fn handle_debounced_events(
     paths_to_add_or_modify.dedup_by(|a, b| a.as_os_str().eq(b.as_os_str()));
 
     info!(
-        "Event processing summary: {} to remove, {} to add/modify, {} new dirs",
+        "Event processing summary: {} to remove, {} dirs to remove, {} to add/modify, {} new dirs",
         paths_to_remove.len(),
+        dirs_to_remove.len(),
         paths_to_add_or_modify.len(),
         new_dirs_to_watch.len()
     );
 
     // Apply file index updates (add/remove) unconditionally — these must
     // happen even when there is no git repository.
-    let (files_to_update_git_status, overflow_count) =
-        if !paths_to_remove.is_empty() || !paths_to_add_or_modify.is_empty() {
-            debug!(
-                "Applying file index changes: {} to remove, {} to add/modify",
-                paths_to_remove.len(),
-                paths_to_add_or_modify.len(),
+    let (files_to_update_git_status, overflow_count) = if !paths_to_remove.is_empty()
+        || !dirs_to_remove.is_empty()
+        || !paths_to_add_or_modify.is_empty()
+    {
+        debug!(
+            "Applying file index changes: {} to remove, {} dirs to remove, {} to add/modify",
+            paths_to_remove.len(),
+            dirs_to_remove.len(),
+            paths_to_add_or_modify.len(),
+        );
+
+        let apply_changes = |picker: &mut FilePicker| -> (Vec<PathBuf>, usize) {
+            // Remove whole directories first so any subsequent single-file
+            // remove event for a path that lived under them becomes a cheap
+            // no-op rather than a failed lookup.
+            for dir in &dirs_to_remove {
+                let count = picker.remove_all_files_in_dir(dir);
+                debug!("remove_all_files_in_dir({:?}) -> {} files", dir, count);
+            }
+
+            for path in &paths_to_remove {
+                let removed = picker.remove_file_by_path(path);
+                debug!("remove_file_by_path({:?}) -> {}", path, removed);
+            }
+
+            let mut files_to_update = Vec::with_capacity(paths_to_add_or_modify.len());
+            for path in &paths_to_add_or_modify {
+                let added = picker.on_create_or_modify(path).is_some();
+                if added {
+                    debug!("on_create_or_modify({:?}) -> Some", path);
+                    files_to_update.push(path.to_path_buf());
+                } else {
+                    error!("on_create_or_modify({:?}) -> None (file not added!)", path);
+                }
+            }
+            let overflow_count = picker.get_overflow_files().len();
+            info!(
+                "apply_changes complete: {} files to update git status, overflow={}",
+                files_to_update.len(),
+                overflow_count,
             );
-
-            let apply_changes = |picker: &mut FilePicker| -> (Vec<PathBuf>, usize) {
-                for path in &paths_to_remove {
-                    let removed = picker.remove_file_by_path(path);
-                    debug!("remove_file_by_path({:?}) -> {}", path, removed);
-                }
-
-                let mut files_to_update = Vec::with_capacity(paths_to_add_or_modify.len());
-                for path in &paths_to_add_or_modify {
-                    let added = picker.on_create_or_modify(path).is_some();
-                    if added {
-                        debug!("on_create_or_modify({:?}) -> Some", path);
-                        files_to_update.push(path.to_path_buf());
-                    } else {
-                        error!("on_create_or_modify({:?}) -> None (file not added!)", path);
-                    }
-                }
-                let overflow_count = picker.get_overflow_files().len();
-                info!(
-                    "apply_changes complete: {} files to update git status, overflow={}",
-                    files_to_update.len(),
-                    overflow_count,
-                );
-                (files_to_update, overflow_count)
-            };
-
-            let Ok(mut guard) = shared_picker.write() else {
-                error!("Failed to acquire file picker write lock");
-                return new_dirs_to_watch;
-            };
-            let Some(ref mut picker) = *guard else {
-                error!("File picker not initialized");
-                return new_dirs_to_watch;
-            };
-            apply_changes(picker)
-        } else {
-            debug!("No file index changes to apply");
-            (Vec::new(), 0)
+            (files_to_update, overflow_count)
         };
+
+        let Ok(mut guard) = shared_picker.write() else {
+            error!("Failed to acquire file picker write lock");
+            return new_dirs_to_watch;
+        };
+        let Some(ref mut picker) = *guard else {
+            error!("File picker not initialized");
+            return new_dirs_to_watch;
+        };
+        apply_changes(picker)
+    } else {
+        debug!("No file index changes to apply");
+        (Vec::new(), 0)
+    };
 
     // The overflow arena grows monotonically as new files are created — a
     // file's chunks are added on creation but never reclaimed on removal.
@@ -584,11 +609,19 @@ fn handle_debounced_events(
     if need_full_git_rescan {
         info!("Triggering full git rescan");
 
-        let result = shared_picker.refresh_git_status(shared_frecency);
-        if let Err(e) = result {
+        if let Err(e) = shared_picker.refresh_git_status(shared_frecency) {
             error!("Failed to refresh git status: {:?}", e);
         }
-        return new_dirs_to_watch;
+        // IMPORTANT: do NOT return here. When a batch contains both
+        // `.git/index` events (e.g. from `git add`) AND worktree-file
+        // Modify events (e.g. a subsequent edit to the same file),
+        // `refresh_git_status` might run while libgit2 sees an
+        // intermediate state — lock-wait mitigates this but can't fully
+        // eliminate it, and refresh doesn't always observe the final
+        // worktree contents if the edit event landed just before the
+        // batch flushed. Re-running the per-path query for explicitly
+        // changed files overrides any stale bits from refresh with an
+        // authoritative per-file status read.
     }
 
     if !files_to_update_git_status.is_empty() {

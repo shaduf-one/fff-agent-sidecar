@@ -1,6 +1,16 @@
 PLENARY_DIR ?= ../plenary.nvim
 
-.PHONY: build test test-rust test-lua test-version test-bun test-node prepare-bun prepare-node set-npm-version header
+# Compile-time cfg that gates the watcher + git-status fuzz stress test.
+# Always set on `test-stress*` targets via RUSTFLAGS.
+STRESS_RUSTFLAGS := --cfg stress
+
+# Pinned seed for the deterministic stress run. Changing this value is
+# equivalent to picking a new regression surface, so keep it stable —
+# that's the whole point. Override ad-hoc on the command line via
+# `FFF_STRESS_SEED=<u64|0xhex> make test-stress-seeded`.
+FFF_STRESS_DEFAULT_SEED ?= 0xDEADBEEFCAFEBABE
+
+.PHONY: build test test-rust test-lua test-version test-bun test-node prepare-bun prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random
 
 all: format test lint
 
@@ -48,6 +58,26 @@ test-node: prepare-node
 	cd packages/fff-node && npm run build && node test/e2e.mjs
 
 test: test-rust test-lua test-version test-bun test-node
+
+
+test-stress-seeded:
+	FFF_STRESS_SEED="$${FFF_STRESS_SEED:-$(FFF_STRESS_DEFAULT_SEED)}" \
+	RUSTFLAGS="$(STRESS_RUSTFLAGS)" \
+	cargo test \
+		-p fff-search \
+		--test fuzz_git_watcher_stress \
+		--features zlob \
+		-- --nocapture stress_seeded
+
+test-stress-random:
+	RUSTFLAGS="$(STRESS_RUSTFLAGS)" \
+	cargo test \
+		-p fff-search \
+		--test fuzz_git_watcher_stress \
+		--features zlob \
+		-- --nocapture stress_random
+
+test-stress: test-stress-seeded test-stress-random
 
 # Update version in a package.json, including optionalDependencies.
 # Usage: make set-npm-version PKG=packages/fff-bun VERSION=1.0.0-nightly.abc1234

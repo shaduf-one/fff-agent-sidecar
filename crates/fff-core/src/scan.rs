@@ -30,8 +30,8 @@ use tracing::{error, info};
 
 use crate::background_watcher::BackgroundWatcher;
 use crate::bigram_filter::BigramOverlay;
-use crate::error::Error;
 use crate::bigram_filter::build_bigram_index;
+use crate::error::Error;
 use crate::file_picker::{self, FFFMode, warmup_mmaps};
 use crate::shared::{SharedFrecency, SharedPicker};
 use crate::types::ContentCacheBudget;
@@ -54,6 +54,13 @@ pub struct ScanSignals {
     /// build is live. Concurrent rescans skip themselves until this
     /// clears so `sync_data` can't be freed under the snapshot.
     pub post_scan_busy: Arc<AtomicBool>,
+    /// Set by any caller that asked for a full rescan while one was
+    /// already running (see [`SharedPicker::trigger_full_rescan_async`]).
+    /// The currently running scan swaps this back to `false` at the end
+    /// of [`ScanJob::run`] and — if it was set — spawns exactly one
+    /// follow-up scan. Without this, `.gitignore` edits or overflow
+    /// rescans that landed during an in-flight scan were silently lost.
+    pub rescan_pending: Arc<AtomicBool>,
 }
 
 /// Which optional phases a scan should run.
@@ -118,7 +125,6 @@ impl ScanJob {
             },
         }))
     }
-
 
     /// Same as [`new`] but without reading from the picker — caller
     /// supplies the base path / mode / flags directly. Used by the
@@ -242,6 +248,38 @@ impl ScanJob {
         if (config.warmup || config.content_indexing) && !signals.cancelled.load(Ordering::Acquire)
         {
             run_post_scan(&shared_picker, &base_path, &signals, &config);
+        }
+
+        // 6. Drain any rescan that arrived while we were busy.
+        //
+        // `trigger_full_rescan_async` sets `rescan_pending` whenever a
+        // caller asks for a rescan while `ScanJob::new` would have
+        // returned `Ok(None)` (scan active *or* post-scan busy). We
+        // consume the flag with `swap` so concurrent requests that land
+        // between the check and the follow-up spawn are still captured
+        // by the next invocation.
+        //
+        // The follow-up deliberately passes `install_watcher=false` —
+        // watcher installation is a bootstrap-only concern.
+        if !signals.cancelled.load(Ordering::Acquire)
+            && signals.rescan_pending.swap(false, Ordering::AcqRel)
+        {
+            match Self::new(&shared_picker, &shared_frecency, false) {
+                Ok(Some(follow_up)) => {
+                    info!("Rescheduling deferred rescan after current scan finished");
+                    follow_up.spawn();
+                }
+                Ok(None) => {
+                    // Another scan slipped in between our post-scan exit
+                    // and the `new()` call above. That scan will drain
+                    // the flag we just cleared — but we re-arm it so it
+                    // does.
+                    signals.rescan_pending.store(true, Ordering::Release);
+                }
+                Err(e) => {
+                    error!(?e, "Failed to reschedule deferred rescan");
+                }
+            }
         }
     }
 }

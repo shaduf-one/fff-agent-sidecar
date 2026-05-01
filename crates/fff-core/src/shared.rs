@@ -1,12 +1,40 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::Error;
 use crate::file_picker::FilePicker;
 use crate::frecency::FrecencyTracker;
 use crate::git::GitStatusCache;
 use crate::query_tracker::QueryTracker;
+
+/// Poll `.git/index.lock` until it disappears (git write completed), giving up
+/// after [`GIT_LOCK_MAX_WAIT`]. Used by [`SharedPicker::refresh_git_status`]
+/// to avoid reading a half-updated index when the watcher fires mid-`git add`.
+///
+/// The wait is bounded and cheap: the lock file is typically cleared within
+/// a few milliseconds of the git command exiting.
+fn wait_for_git_index_lock_release(git_root: &Path) {
+    const GIT_LOCK_POLL: Duration = Duration::from_millis(10);
+    const GIT_LOCK_MAX_WAIT: Duration = Duration::from_millis(500);
+
+    let lock = git_root.join(".git").join("index.lock");
+    // Fast path: no lock present.
+    if !lock.exists() {
+        return;
+    }
+    let deadline = Instant::now() + GIT_LOCK_MAX_WAIT;
+    while lock.exists() && Instant::now() < deadline {
+        std::thread::sleep(GIT_LOCK_POLL);
+    }
+    if lock.exists() {
+        tracing::warn!(
+            "Proceeding with git status refresh despite lingering \
+             .git/index.lock at {} — will retry once it clears",
+            lock.display()
+        );
+    }
+}
 
 /// Thread-safe shared handle to the [`FilePicker`] instance.
 ///
@@ -92,20 +120,40 @@ impl SharedPicker {
     /// under a brief write, then applies git status, frecency, warmup,
     /// and bigram rebuild — all off-lock aside from two µs-long writes.
     /// Returns immediately.
+    ///
+    /// If a scan (or its post-scan phase) is already running, this call
+    /// flips the `rescan_pending` signal instead of spawning a second
+    /// one. The running scan drains the flag at the end of its
+    /// [`ScanJob::run`] and reschedules exactly one follow-up so the
+    /// request is never silently dropped.
     pub fn trigger_full_rescan_async(&self, shared_frecency: &SharedFrecency) -> Result<(), Error> {
-        if let Some(job) = crate::scan::ScanJob::new(
-            self,
-            shared_frecency,
-            /*install_watcher=*/ false,
-        )? {
-            job.spawn();
+        match crate::scan::ScanJob::new(self, shared_frecency, /*install_watcher=*/ false)? {
+            Some(job) => {
+                job.spawn();
+            }
+            None => {
+                // A scan is already in flight — mark a follow-up as
+                // needed. The running scan's `run()` drains this flag
+                // and reschedules itself.
+                if let Ok(guard) = self.read()
+                    && let Some(picker) = guard.as_ref()
+                {
+                    picker
+                        .scan_signals()
+                        .rescan_pending
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    tracing::info!(
+                        "Full rescan requested while another scan is active — \
+                         deferred via rescan_pending flag"
+                    );
+                }
+            }
         }
         Ok(())
     }
 
     /// Refresh git statuses for all indexed files.
     pub fn refresh_git_status(&self, shared_frecency: &SharedFrecency) -> Result<usize, Error> {
-        use git2::StatusOptions;
         use tracing::debug;
 
         let git_status = {
@@ -119,13 +167,21 @@ impl SharedPicker {
                 picker.git_root()
             );
 
+            // Wait briefly for any in-progress git operation to release
+            // its `.git/index.lock`. libgit2 reads `.git/index` directly
+            // and does NOT coordinate with the filesystem lock; if a
+            // writer is mid-atomic-rename (lock file exists, new index
+            // not yet swapped in), we would observe stale status data.
+            // This matters most for the background watcher, which
+            // typically fires refresh in response to the very events
+            // produced by that in-flight git write.
+            if let Some(root) = picker.git_root() {
+                wait_for_git_index_lock_release(root);
+            }
+
             GitStatusCache::read_git_status(
                 picker.git_root(),
-                StatusOptions::new()
-                    .include_untracked(true)
-                    .recurse_untracked_dirs(true)
-                    .include_unmodified(true)
-                    .exclude_submodules(true),
+                &mut crate::git::default_status_options(),
             )
         };
 

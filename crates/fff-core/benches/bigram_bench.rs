@@ -127,9 +127,7 @@ fn bench_bigram_build(c: &mut Criterion) {
                     ));
                     s.push_str("    let parsed = ctx.parse()?;\n");
                     s.push_str("    let validated = parsed.validate()?;\n");
-                    s.push_str(&format!(
-                        "    ctx.respond(validated, {}).await\n"
-                    , j));
+                    s.push_str(&format!("    ctx.respond(validated, {}).await\n", j));
                     s.push_str("}\n\n");
                 }
                 s
