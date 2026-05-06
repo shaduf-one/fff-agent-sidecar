@@ -1,8 +1,8 @@
-use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use fff::{
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_LIMIT: usize = 20;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
+const STDERR_TAIL_BYTES: usize = 8 * 1024;
 
 pub type Result<T> = std::result::Result<T, AgentError>;
 
@@ -51,10 +52,30 @@ pub enum AgentError {
     },
     #[error("failed to spawn daemon: {0}")]
     SpawnDaemon(#[source] std::io::Error),
-    #[error("daemon did not become ready at {path}")]
-    DaemonStartupTimeout { path: PathBuf },
+    #[error(
+        "daemon exited before becoming ready at {path}; stderr log: {log_path}; status: {status}; stderr: {stderr}"
+    )]
+    DaemonExitedBeforeReady {
+        path: PathBuf,
+        log_path: PathBuf,
+        status: ExitStatus,
+        stderr: String,
+    },
+    #[error("daemon did not become ready at {path}; stderr log: {log_path}; stderr: {stderr}")]
+    DaemonStartupTimeout {
+        path: PathBuf,
+        log_path: PathBuf,
+        stderr: String,
+    },
+    #[error("failed to poll daemon process: {0}")]
+    PollDaemon(#[source] std::io::Error),
     #[error("failed to bind daemon socket {path}: {source}")]
     Bind {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to create daemon stderr log {path}: {source}")]
+    CreateLogFile {
         path: PathBuf,
         source: std::io::Error,
     },
@@ -171,6 +192,14 @@ pub fn resolve_repo_root(start: Option<&Path>) -> Result<PathBuf> {
 }
 
 pub fn socket_path_for_repo(repo: &Path) -> Result<PathBuf> {
+    Ok(runtime_dir().join(format!("{}.sock", repo_hash(repo)?)))
+}
+
+fn daemon_log_path_for_repo(repo: &Path) -> Result<PathBuf> {
+    Ok(runtime_dir().join(format!("{}.log", repo_hash(repo)?)))
+}
+
+fn repo_hash(repo: &Path) -> Result<String> {
     let canonical = repo
         .canonicalize()
         .map_err(|source| AgentError::Canonicalize {
@@ -178,9 +207,14 @@ pub fn socket_path_for_repo(repo: &Path) -> Result<PathBuf> {
             source,
         })?;
     let hash = blake3::hash(canonical.to_string_lossy().as_bytes());
-    Ok(std::env::temp_dir()
-        .join("fff-agent")
-        .join(format!("{}.sock", &hash.to_hex()[..16])))
+    Ok(hash.to_hex()[..16].to_string())
+}
+
+fn runtime_dir() -> PathBuf {
+    match std::env::var_os("FFF_AGENT_RUNTIME_DIR") {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => std::env::temp_dir().join("fff-agent"),
+    }
 }
 
 pub fn send_request(repo: &Path, request: AgentRequest) -> Result<AgentResponse> {
@@ -252,6 +286,7 @@ fn ensure_daemon(repo: &Path, socket: &Path) -> Result<()> {
         return Ok(());
     }
 
+    let log_path = daemon_log_path_for_repo(repo)?;
     if socket.exists() {
         fs::remove_file(socket).map_err(|source| AgentError::RemoveStaleSocket {
             path: socket.to_path_buf(),
@@ -264,8 +299,12 @@ fn ensure_daemon(repo: &Path, socket: &Path) -> Result<()> {
             source,
         })?;
     }
+    let stderr_log = File::create(&log_path).map_err(|source| AgentError::CreateLogFile {
+        path: log_path.clone(),
+        source,
+    })?;
 
-    Command::new(std::env::current_exe().map_err(AgentError::SpawnDaemon)?)
+    let mut child = Command::new(std::env::current_exe().map_err(AgentError::SpawnDaemon)?)
         .arg("daemon")
         .arg("--repo")
         .arg(repo)
@@ -273,7 +312,7 @@ fn ensure_daemon(repo: &Path, socket: &Path) -> Result<()> {
         .arg(socket)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(stderr_log))
         .spawn()
         .map_err(AgentError::SpawnDaemon)?;
 
@@ -282,12 +321,38 @@ fn ensure_daemon(repo: &Path, socket: &Path) -> Result<()> {
         if call_daemon(socket, &AgentRequest::Status).is_ok() {
             return Ok(());
         }
+        if let Some(status) = child.try_wait().map_err(AgentError::PollDaemon)? {
+            return Err(AgentError::DaemonExitedBeforeReady {
+                path: socket.to_path_buf(),
+                log_path: log_path.clone(),
+                status,
+                stderr: stderr_tail(&log_path),
+            });
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 
     Err(AgentError::DaemonStartupTimeout {
         path: socket.to_path_buf(),
+        log_path: log_path.clone(),
+        stderr: stderr_tail(&log_path),
     })
+}
+
+fn stderr_tail(path: &Path) -> String {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) => return format!("<unavailable: {error}>"),
+    };
+    let mut bytes = Vec::new();
+    if let Err(error) = file.read_to_end(&mut bytes) {
+        return format!("<unavailable: {error}>");
+    }
+    if bytes.is_empty() {
+        return "<empty>".to_string();
+    }
+    let start = bytes.len().saturating_sub(STDERR_TAIL_BYTES);
+    String::from_utf8_lossy(&bytes[start..]).trim().to_string()
 }
 
 fn call_daemon(socket: &Path, request: &AgentRequest) -> Result<AgentResponse> {

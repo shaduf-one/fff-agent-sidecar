@@ -39,6 +39,8 @@ fff-agent stop --repo /path/to/repo
 
 The first command starts one daemon per repository. The daemon keeps FFF's index
 warm in memory. Later CLI calls reuse that daemon through a local Unix socket.
+Set `FFF_AGENT_RUNTIME_DIR=/path/to/runtime-dir` to override where the socket
+and daemon stderr log are written.
 
 ## Safe Defaults
 
@@ -78,7 +80,8 @@ cargo fmt --package fff-agent -- --check
 ```
 
 On macOS, daemon integration tests need permission to bind a local Unix socket.
-If a sandbox blocks socket binding, run the tests in a normal local shell.
+If a sandbox blocks socket binding, `fff-agent` reports the daemon stderr log
+path and the underlying bind error.
 
 ## Status
 
