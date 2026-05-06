@@ -24,3 +24,6 @@ codemods.
 
 Keep commands repo-scoped with `--repo /path/to/repo` when the current working
 directory is ambiguous.
+
+If daemon startup fails, read the emitted stderr log path; Codex sandboxes may
+block Unix socket binding.
